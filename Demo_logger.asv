@@ -1,0 +1,698 @@
+clear; clc; close all;
+
+set(groot, 'defaultFigureColor', 'w');
+set(groot, 'defaultAxesColor', 'w');
+set(groot, 'defaultAxesXColor', 'k');
+set(groot, 'defaultAxesYColor', 'k');
+set(groot, 'defaultAxesZColor', 'k');
+set(groot, 'defaultTextColor', 'k');
+set(groot, 'defaultAxesFontName', 'Times New Roman');
+set(groot, 'defaultTextFontName', 'Times New Roman');
+set(groot, 'defaultLegendFontName', 'Times New Roman');
+
+%% file
+
+npz_file = fullfile(pwd, 'log', 'demo10.npz');
+
+if ~isfile(npz_file)
+    error('NPZ file not found:\n%s', npz_file);
+end
+
+%% Config
+
+cfg = struct();
+
+cfg.tLim = [60 75];  % [] -> use whole range
+
+cfg.thrust_margin = 20.0;
+
+cfg.smooth.thrust      = 0.01;
+cfg.smooth.pos_z       = 0.1;
+cfg.smooth.roll_act    = 0.08;
+cfg.smooth.roll_des    = 0.05;
+cfg.smooth.roll_mrg    = 0.05;
+cfg.smooth.tau         = 0.05;
+
+% plot limits
+% [] -> auto
+cfg.lim.thrust = [0 35];
+cfg.lim.tau    = [-7 6];
+cfg.lim.z      = [-0.4 0.1];
+cfg.lim.roll   = [-30 30];
+
+% z plot direction
+% true  -> z-axis is plotted upside down
+% false -> normal y-axis direction
+cfg.z_reverse = false;
+
+cfg.phase.regions = {
+    60.0,  63.0,  'Payload loaded', [0.88 0.95 0.86];
+    63.0,  75.0,  'Moving',         [0.86 0.92 0.98];
+};
+
+cfg.phase.alpha = 0.35;
+
+cfg.result.regions = {
+    60.0,  68.0,  'SUCCESS', [0.86 0.92 1.00];
+    68.0,  75.0,  'FAIL',    [1.00 0.86 0.86];
+};
+
+cfg.result.alpha = 0.30;
+
+% vertical event line
+cfg.objectGrip.t = 63.0;
+cfg.objectGrip.label = 'Object grip';
+cfg.objectGrip.color = [0.20 0.20 0.20];
+
+cfg.figPos = [40 30 1250 1150];
+cfg.mainPos = [0.070 0.055 0.900 0.905];
+
+%% Load data
+
+D = load_npz_all(npz_file);
+
+disp('===== Loaded fields =====');
+disp(fieldnames(D));
+
+[t, t_name] = pickField(D, {'t', 'time'});
+
+if isempty(t)
+    error('Time field not found.');
+end
+
+t = t(:);
+
+fprintf('\nTime field : %s\n', t_name);
+fprintf('Time range : %.3f ~ %.3f s\n', t(1), t(end));
+
+%% Pick fields
+
+[pos, pos_name] = pickField(D, {'pos'});
+[pos_d, pos_d_name] = pickField(D, {'pos_d', 'pos_des'});
+
+[rpy, rpy_name] = pickField(D, {'rpy'});
+[rpy_raw, rpy_raw_name] = pickField(D, {'rpy_raw', 'rpy_des_raw'});
+[rpy_d, rpy_d_name] = pickField(D, {'rpy_d', 'rpy_des'});
+
+% thrust
+% F_raw : saturation before / unconstrained thrust
+% F_con : saturation after / constrained thrust
+[F_raw, F_raw_name] = pickField(D, {'f_thrst', 'f_thrust', 'f_thrust_num', 'f_thrst_num'});
+[F_con, F_con_name] = pickField(D, {'f_thrst_con', 'f_thrust_con', 'f_thrust_sat', 'f_thrst_sat'});
+
+[tau_d, tau_d_name] = pickField(D, {'tau_d', 'tau_des'});
+[tau_thrust, tau_thrust_name] = pickField(D, {'tau_thrust'});
+[tau_off, tau_off_name] = pickField(D, {'tau_off'});
+
+fprintf('\n===== Field map =====\n');
+print_map('pos', pos_name);
+print_map('pos_d', pos_d_name);
+print_map('rpy', rpy_name);
+print_map('rpy_raw', rpy_raw_name);
+print_map('rpy_d', rpy_d_name);
+print_map('thrust raw', F_raw_name);
+print_map('thrust con', F_con_name);
+print_map('tau_d', tau_d_name);
+print_map('tau_thrust', tau_thrust_name);
+print_map('tau_off', tau_off_name);
+
+%% Crop time
+
+if isempty(cfg.tLim)
+    idx = true(size(t));
+else
+    idx = (t >= cfg.tLim(1)) & (t <= cfg.tLim(2));
+end
+
+t = t(idx);
+
+if isempty(t)
+    error('No data after time crop. Check cfg.tLim.');
+end
+
+pos = crop_if(pos, idx);
+pos_d = crop_if(pos_d, idx);
+rpy = crop_if(rpy, idx);
+rpy_raw = crop_if(rpy_raw, idx);
+rpy_d = crop_if(rpy_d, idx);
+F_raw = crop_if(F_raw, idx);
+F_con = crop_if(F_con, idx);
+tau_d = crop_if(tau_d, idx);
+tau_thrust = crop_if(tau_thrust, idx);
+tau_off = crop_if(tau_off, idx);
+
+fprintf('\nAfter crop: N = %d\n', numel(t));
+
+%% Data arrangement
+
+N = numel(t);
+
+% z axis
+z = ensure_len(pick_col(pos, 3), N);
+z_d = ensure_len(pick_col(pos_d, 3), N);
+
+% roll
+roll_act = ensure_len(pick_col(rpy, 1), N);
+roll_raw = ensure_len(pick_col(rpy_raw, 1), N);
+roll_mrg = ensure_len(pick_col(rpy_d, 1), N);
+
+if all(isnan(roll_raw)) && ~all(isnan(roll_mrg))
+    roll_raw = roll_mrg;
+end
+
+if all(isnan(roll_mrg)) && ~all(isnan(roll_raw))
+    roll_mrg = roll_raw;
+end
+
+% thrust raw / unconstrained
+if isempty(F_raw) || size(F_raw, 2) < 4
+    F1_raw = nan(N, 1);
+    F2_raw = nan(N, 1);
+    F3_raw = nan(N, 1);
+    F4_raw = nan(N, 1);
+else
+    F1_raw = ensure_len(F_raw(:, 1), N);
+    F2_raw = ensure_len(F_raw(:, 2), N);
+    F3_raw = ensure_len(F_raw(:, 3), N);
+    F4_raw = ensure_len(F_raw(:, 4), N);
+end
+
+% thrust constrained / saturated
+if isempty(F_con) || size(F_con, 2) < 4
+    F1_con = min(F1_raw, cfg.thrust_margin);
+    F2_con = min(F2_raw, cfg.thrust_margin);
+    F3_con = min(F3_raw, cfg.thrust_margin);
+    F4_con = min(F4_raw, cfg.thrust_margin);
+else
+    F1_con = ensure_len(F_con(:, 1), N);
+    F2_con = ensure_len(F_con(:, 2), N);
+    F3_con = ensure_len(F_con(:, 3), N);
+    F4_con = ensure_len(F_con(:, 4), N);
+end
+
+F1_con_plot = min(F1_con, cfg.thrust_margin);
+F2_con_plot = min(F2_con, cfg.thrust_margin);
+F3_con_plot = min(F3_con, cfg.thrust_margin);
+F4_con_plot = min(F4_con, cfg.thrust_margin);
+
+% roll torque direction
+tau_x_des = ensure_len(pick_col(tau_d, 1), N);
+tau_x_thrust = ensure_len(pick_col(tau_thrust, 1), N);
+tau_x_off = ensure_len(pick_col(tau_off, 1), N);
+
+% tau_off is only x,y, so torque reconstruction:
+% tau_x_des = tau_x_thrust + tau_x_off
+% if tau_thrust is missing, use tau_x_des - tau_x_off
+if all(isnan(tau_x_thrust)) && ~all(isnan(tau_x_des)) && ~all(isnan(tau_x_off))
+    tau_x_thrust = tau_x_des - tau_x_off;
+end
+
+%% Smoothing
+
+F1_raw_s = lpf1(F1_raw, cfg.smooth.thrust);
+F2_raw_s = lpf1(F2_raw, cfg.smooth.thrust);
+F3_raw_s = lpf1(F3_raw, cfg.smooth.thrust);
+F4_raw_s = lpf1(F4_raw, cfg.smooth.thrust);
+
+F1_con_s = lpf1(F1_con, cfg.smooth.thrust);
+F2_con_s = lpf1(F2_con, cfg.smooth.thrust);
+F3_con_s = lpf1(F3_con, cfg.smooth.thrust);
+F4_con_s = lpf1(F4_con, cfg.smooth.thrust);
+
+z_s = lpf1(z, cfg.smooth.pos_z);
+z_d_s = lpf1(z_d, cfg.smooth.pos_z);
+
+roll_act_s = rad2deg(lpf1(roll_act, cfg.smooth.roll_act));
+roll_raw_s = rad2deg(lpf1(roll_raw, cfg.smooth.roll_des));
+roll_mrg_s = rad2deg(lpf1(roll_mrg, cfg.smooth.roll_mrg));
+
+tau_x_des_s = lpf1(tau_x_des, cfg.smooth.tau);
+tau_x_thrust_s = lpf1(tau_x_thrust, cfg.smooth.tau);
+tau_x_off_s = lpf1(tau_x_off, cfg.smooth.tau);
+
+%% Colors
+
+C.F1 = [0.00 0.35 0.85];
+C.F2 = [0.85 0.15 0.15];
+C.F3 = [0.15 0.70 0.35];
+C.F4 = [0.90 0.65 0.10];
+
+C.des = [0.10 0.10 0.10];
+C.act = [0.00 0.35 0.85];
+C.mrg = [0.90 0.15 0.15];
+
+C.tau_des = [0.10 0.10 0.10];
+C.tau_thrust = [0.15 0.45 0.90];
+C.tau_off = [0.85 0.35 0.65];
+
+%% Figure
+
+fig = figure('Color', 'w', 'Position', cfg.figPos);
+set(fig, 'InvertHardcopy', 'off');
+
+TL = tiledlayout(fig, 4, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+TL.Position = cfg.mainPos;
+
+% 1) Rotor thrusts
+ax1 = nexttile(TL, 1);
+hold(ax1, 'on');
+
+p1r = plot(ax1, t, F1_raw_s, '--', 'LineWidth', 1.2, 'Color', C.F1);
+p2r = plot(ax1, t, F2_raw_s, '--', 'LineWidth', 1.2, 'Color', C.F2);
+p3r = plot(ax1, t, F3_raw_s, '--', 'LineWidth', 1.2, 'Color', C.F3);
+p4r = plot(ax1, t, F4_raw_s, '--', 'LineWidth', 1.2, 'Color', C.F4);
+
+p1c = plot(ax1, t, F1_con_s, 'LineWidth', 1.9, 'Color', C.F1);
+p2c = plot(ax1, t, F2_con_s, 'LineWidth', 1.9, 'Color', C.F2);
+p3c = plot(ax1, t, F3_con_s, 'LineWidth', 1.9, 'Color', C.F3);
+p4c = plot(ax1, t, F4_con_s, 'LineWidth', 1.9, 'Color', C.F4);
+
+yline(ax1, cfg.thrust_margin, '--', 'Thrust margin', 'Color', [0.35 0.35 0.35], 'LineWidth', 1.4, 'LabelHorizontalAlignment', 'left');
+
+grid(ax1, 'on');
+ylabel(ax1, 'Thrust [N]');
+title(ax1, 'Rotor thrusts');
+
+xlim_auto_or_cfg(ax1, t, cfg.tLim);
+apply_ylim(ax1, cfg.lim.thrust);
+
+add_phase_regions(ax1, cfg.phase.regions, cfg.phase.alpha);
+add_result_regions(ax1, cfg.result.regions, cfg.result.alpha);
+hg1 = add_vertical_event_line(ax1, cfg.objectGrip.t, cfg.objectGrip.label, cfg.objectGrip.color);
+
+uistack([p1r p2r p3r p4r p1c p2c p3c p4c hg1], 'top');
+
+legend(ax1, [p1c p2c p3c p4c p1r], ...
+    {'F_{1,con}', 'F_{2,con}', 'F_{3,con}', 'F_{4,con}', 'raw / unconstrained'}, ...
+    'Location', 'southeast', ...
+    'Orientation', 'horizontal', ...
+    'Box', 'on');
+
+% 2) Roll torque
+ax2 = nexttile(TL, 2);
+hold(ax2, 'on');
+
+ht1 = plot(ax2, t, tau_x_des_s, '--', 'LineWidth', 1.5, 'Color', C.tau_des);
+ht2 = plot(ax2, t, tau_x_thrust_s, 'LineWidth', 1.8, 'Color', C.tau_thrust);
+ht3 = plot(ax2, t, tau_x_off_s, 'LineWidth', 1.8, 'Color', C.tau_off);
+
+yline(ax2, 0, '--', 'Color', [0.55 0.55 0.55], 'LineWidth', 1.0, 'HandleVisibility', 'off');
+
+grid(ax2, 'on');
+ylabel(ax2, '\tau_x [N m]');
+title(ax2, 'Roll torque');
+
+xlim_auto_or_cfg(ax2, t, cfg.tLim);
+apply_ylim(ax2, cfg.lim.tau);
+
+add_phase_regions(ax2, cfg.phase.regions, cfg.phase.alpha);
+add_result_regions(ax2, cfg.result.regions, cfg.result.alpha);
+hg2 = add_vertical_event_line(ax2, cfg.objectGrip.t, cfg.objectGrip.label, cfg.objectGrip.color);
+
+uistack([ht1 ht2 ht3 hg2], 'top');
+
+legend(ax2, [ht1 ht2 ht3], {'\tau_{x,des}', '\tau_{x,thrust}', '\tau_{x,off}'}, 'Location', 'southwest', 'Box', 'on');
+
+% 3) Z-axis
+ax3 = nexttile(TL, 3);
+hold(ax3, 'on');
+
+hz1 = plot(ax3, t, z_d_s-z_s, 'LineWidth', 1.6, 'Color', C.des);
+
+grid(ax3, 'on');
+ylabel(ax3, 'z_{des}-z [m]');
+title(ax3, 'Z-axis tracking');
+
+xlim_auto_or_cfg(ax3, t, cfg.tLim);
+apply_ylim(ax3, cfg.lim.z);
+
+if cfg.z_reverse
+    set(ax3, 'YDir', 'reverse');
+else
+    set(ax3, 'YDir', 'normal');
+end
+
+add_phase_regions(ax3, cfg.phase.regions, cfg.phase.alpha);
+add_result_regions(ax3, cfg.result.regions, cfg.result.alpha);
+hg3 = add_vertical_event_line(ax3, cfg.objectGrip.t, cfg.objectGrip.label, cfg.objectGrip.color);
+
+uistack([hz1 hg3], 'top');
+
+legend(ax3, [hz1], {'z_{des}-z'}, 'Location', 'southeast', 'Box', 'on');
+
+% 4) Roll attitude
+ax4 = nexttile(TL, 4);
+hold(ax4, 'on');
+
+hr1 = plot(ax4, t, roll_raw_s, '--', 'LineWidth', 1.5, 'Color', C.des);
+hr2 = plot(ax4, t, roll_mrg_s, 'LineWidth', 1.8, 'Color', C.mrg);
+hr3 = plot(ax4, t, roll_act_s, 'LineWidth', 1.8, 'Color', C.act);
+
+grid(ax4, 'on');
+xlabel(ax4, 'Time [s]');
+ylabel(ax4, 'roll [deg]');
+title(ax4, 'Roll tracking');
+
+xlim_auto_or_cfg(ax4, t, cfg.tLim);
+apply_ylim(ax4, cfg.lim.roll);
+
+add_phase_regions(ax4, cfg.phase.regions, cfg.phase.alpha);
+add_result_regions(ax4, cfg.result.regions, cfg.result.alpha);
+hg4 = add_vertical_event_line(ax4, cfg.objectGrip.t, cfg.objectGrip.label, cfg.objectGrip.color);
+
+uistack([hr1 hr2 hr3 hg4], 'top');
+
+legend(ax4, [hr1 hr2 hr3], {'roll_{raw}', 'roll_{MRG}', 'roll'}, 'Location', 'southwest', 'Box', 'on');
+
+linkaxes([ax1 ax2 ax3 ax4], 'x');
+
+apply_paper_style(fig);
+
+%% print summary
+
+fprintf('\n===== Plot summary =====\n');
+fprintf('Thrust margin clip = %.3f N\n', cfg.thrust_margin);
+
+if ~all(isnan(F1_raw))
+    fprintf('Max F1 raw         = %.3f N\n', max(F1_raw, [], 'omitnan'));
+    fprintf('Max F2 raw         = %.3f N\n', max(F2_raw, [], 'omitnan'));
+    fprintf('Max F3 raw         = %.3f N\n', max(F3_raw, [], 'omitnan'));
+    fprintf('Max F4 raw         = %.3f N\n', max(F4_raw, [], 'omitnan'));
+end
+
+if ~all(isnan(F1_con))
+    fprintf('Max F1 constrained = %.3f N\n', max(F1_con, [], 'omitnan'));
+    fprintf('Max F2 constrained = %.3f N\n', max(F2_con, [], 'omitnan'));
+    fprintf('Max F3 constrained = %.3f N\n', max(F3_con, [], 'omitnan'));
+    fprintf('Max F4 constrained = %.3f N\n', max(F4_con, [], 'omitnan'));
+end
+
+%% local functions
+
+function D = load_npz_all(npz_file)
+    np = py.importlib.import_module('numpy');
+    data = np.load(npz_file, pyargs('allow_pickle', true));
+
+    keys_cell = cell(data.files);
+    keys = cellfun(@char, keys_cell, 'UniformOutput', false);
+
+    D = struct();
+
+    for i = 1:numel(keys)
+        key = keys{i};
+        key_valid = matlab.lang.makeValidName(key);
+        arr_py = data.get(key);
+
+        try
+            arr = double(arr_py);
+            D.(key_valid) = arr;
+        catch
+            try
+                D.(key_valid) = char(arr_py);
+            catch
+                D.(key_valid) = arr_py;
+            end
+        end
+    end
+end
+
+function [data, used_name] = pickField(D, candidates)
+    data = [];
+    used_name = '';
+
+    for k = 1:numel(candidates)
+        f = matlab.lang.makeValidName(candidates{k});
+        if isfield(D, f)
+            data = D.(f);
+            used_name = f;
+            return;
+        end
+    end
+end
+
+function y = crop_if(x, idx)
+    if isempty(x)
+        y = x;
+        return;
+    end
+
+    if isnumeric(x) && ~isscalar(x)
+        if size(x, 1) == numel(idx)
+            y = x(idx, :);
+        else
+            y = x;
+        end
+    else
+        y = x;
+    end
+end
+
+function c = pick_col(x, n)
+    if isempty(x) || ~isnumeric(x)
+        c = [];
+        return;
+    end
+
+    if isvector(x)
+        x = x(:);
+
+        if n == 1
+            c = x;
+        else
+            c = nan(size(x));
+        end
+
+        return;
+    end
+
+    if size(x, 2) >= n
+        c = x(:, n);
+    else
+        c = nan(size(x, 1), 1);
+    end
+end
+
+function y = ensure_len(x, n)
+    if isempty(x)
+        y = nan(n, 1);
+        return;
+    end
+
+    x = double(x);
+    x = x(:);
+
+    if numel(x) == n
+        y = x;
+    elseif numel(x) > n
+        y = x(1:n);
+    else
+        y = nan(n, 1);
+        y(1:numel(x)) = x;
+    end
+end
+
+function y = lpf1(x, alpha)
+    if isempty(x)
+        y = x;
+        return;
+    end
+
+    x = double(x);
+
+    if all(isnan(x))
+        y = x;
+        return;
+    end
+
+    if isempty(alpha) || alpha <= 0 || alpha > 1
+        y = x;
+        return;
+    end
+
+    y = x;
+
+    first_valid = find(~isnan(x), 1, 'first');
+
+    if isempty(first_valid)
+        y = x;
+        return;
+    end
+
+    y(1:first_valid) = x(first_valid);
+
+    for i = first_valid+1:numel(x)
+        xi = x(i);
+        yim1 = y(i-1);
+
+        if isnan(xi)
+            xi = yim1;
+        end
+
+        y(i) = alpha * xi + (1 - alpha) * yim1;
+    end
+end
+
+function add_phase_regions(ax, regions, alpha_val)
+    if isempty(regions)
+        return;
+    end
+
+    hold(ax, 'on');
+    xl = xlim(ax);
+    yl = ylim(ax);
+
+    for i = 1:size(regions, 1)
+        x1 = regions{i, 1};
+        x2 = regions{i, 2};
+        label = regions{i, 3};
+        color_in = regions{i, 4};
+
+        if x2 <= xl(1) || x1 >= xl(2)
+            continue;
+        end
+
+        xp1 = max(x1, xl(1));
+        xp2 = min(x2, xl(2));
+
+        p = patch(ax, [xp1 xp2 xp2 xp1], [yl(1) yl(1) yl(2) yl(2)], color_in, ...
+            'FaceAlpha', alpha_val, ...
+            'EdgeColor', 'none', ...
+            'HandleVisibility', 'off', ...
+            'HitTest', 'off');
+
+        uistack(p, 'bottom');
+
+        text(ax, (xp1 + xp2) / 2, yl(2) - 0.06 * (yl(2) - yl(1)), label, ...
+            'HorizontalAlignment', 'center', ...
+            'VerticalAlignment', 'top', ...
+            'FontWeight', 'bold', ...
+            'FontName', 'Times New Roman', ...
+            'FontSize', 9, ...
+            'Color', [0.15 0.25 0.35], ...
+            'Clipping', 'on');
+    end
+end
+
+function add_result_regions(ax, regions, alpha_val)
+    if isempty(regions)
+        return;
+    end
+
+    hold(ax, 'on');
+    xl = xlim(ax);
+    yl = ylim(ax);
+
+    for i = 1:size(regions, 1)
+        x1 = regions{i, 1};
+        x2 = regions{i, 2};
+        label = regions{i, 3};
+        color_in = regions{i, 4};
+
+        if x2 <= xl(1) || x1 >= xl(2)
+            continue;
+        end
+
+        xp1 = max(x1, xl(1));
+        xp2 = min(x2, xl(2));
+
+        p = patch(ax, [xp1 xp2 xp2 xp1], [yl(1) yl(1) yl(2) yl(2)], color_in, ...
+            'FaceAlpha', alpha_val, ...
+            'EdgeColor', 'none', ...
+            'HandleVisibility', 'off', ...
+            'HitTest', 'off');
+
+        uistack(p, 'bottom');
+
+        text(ax, (xp1 + xp2) / 2, yl(2) - 0.14 * (yl(2) - yl(1)), label, ...
+            'HorizontalAlignment', 'center', ...
+            'VerticalAlignment', 'top', ...
+            'FontWeight', 'bold', ...
+            'FontName', 'Times New Roman', ...
+            'FontSize', 10, ...
+            'Color', [0.20 0.20 0.20], ...
+            'Clipping', 'on');
+    end
+end
+
+function h = add_vertical_event_line(ax, t_event, label_txt, color_in)
+    hold(ax, 'on');
+
+    h = xline(ax, t_event, '--', ...
+        'Color', color_in, ...
+        'LineWidth', 1.2, ...
+        'HandleVisibility', 'off');
+
+    yl = ylim(ax);
+    text_y = yl(1) + 0.12 * (yl(2) - yl(1));
+
+    text(ax, t_event + 0.12, text_y, label_txt, ...
+        'FontName', 'Times New Roman', ...
+        'FontSize', 9, ...
+        'FontWeight', 'bold', ...
+        'Color', color_in, ...
+        'HorizontalAlignment', 'left', ...
+        'VerticalAlignment', 'middle', ...
+        'Clipping', 'on');
+end
+
+function xlim_auto_or_cfg(ax, t, tLim)
+    if isempty(tLim)
+        xlim(ax, [t(1) t(end)]);
+    else
+        xlim(ax, tLim);
+    end
+end
+
+function apply_ylim(ax, yLim)
+    if isempty(yLim)
+        return;
+    end
+
+    ylim(ax, yLim);
+end
+
+function apply_paper_style(fig)
+    set(fig, 'Color', 'w');
+    set(fig, 'InvertHardcopy', 'off');
+
+    ax_all = findall(fig, 'Type', 'axes');
+
+    for i = 1:numel(ax_all)
+        ax = ax_all(i);
+
+        set(ax, 'Color', 'w');
+        set(ax, 'XColor', 'k');
+        set(ax, 'YColor', 'k');
+        set(ax, 'ZColor', 'k');
+        set(ax, 'FontName', 'Times New Roman');
+        set(ax, 'FontSize', 10);
+        set(ax, 'LineWidth', 0.8);
+        set(ax, 'Box', 'on');
+
+        grid(ax, 'on');
+    end
+
+    txt_all = findall(fig, 'Type', 'text');
+
+    for i = 1:numel(txt_all)
+        set(txt_all(i), 'FontName', 'Times New Roman');
+    end
+
+    leg_all = findall(fig, 'Type', 'legend');
+
+    for i = 1:numel(leg_all)
+        set(leg_all(i), 'Color', 'w');
+        set(leg_all(i), 'TextColor', 'k');
+        set(leg_all(i), 'EdgeColor', [0.20 0.20 0.20]);
+        set(leg_all(i), 'LineWidth', 0.8);
+        set(leg_all(i), 'FontName', 'Times New Roman');
+    end
+end
+
+function print_map(name, used_name)
+    if isempty(used_name)
+        fprintf('%-14s : [not found]\n', name);
+    else
+        fprintf('%-14s : %s\n', name, used_name);
+    end
+end
