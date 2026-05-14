@@ -1,0 +1,25 @@
+cat > .gitignore <<'EOF'
+*.asv
+
+slprj/
+*.slxc
+*.mex*
+*.mexa64
+*.mexw64
+*.mexmaci64
+
+*.m~
+*.mat.tmp
+
+*.fig
+*.png
+*.jpg
+*.jpeg
+
+.DS_Store
+Thumbs.db
+
+.vscode/
+*.swp
+*.swo
+EOF

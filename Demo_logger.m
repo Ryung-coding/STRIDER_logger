@@ -16,7 +16,7 @@ baseLogDir = fullfile(pwd, 'log');
 
 globalCfg = struct();
 
-globalCfg.thrust_margin = 20.0;
+globalCfg.thrust_margin = 22.0;
 
 globalCfg.smooth.thrust      = 0.02;
 globalCfg.smooth.pos_z       = 0.08;
